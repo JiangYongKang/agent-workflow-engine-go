@@ -37,6 +37,9 @@ type Store interface {
 	LoadByIdemKey(key string) (*Execution, error)
 	// ListUnfinished 返回所有非终态执行，用于崩溃恢复。
 	ListUnfinished() ([]*Execution, error)
+	// ListResumes 返回同一续跑链（RootID 相同）的全部执行记录，
+	// 按开始时间升序，便于审计追溯。
+	ListResumes(rootID string) ([]*Execution, error)
 }
 
 // MemoryStore 是进程内 Store 实现。
@@ -89,6 +92,19 @@ func (m *MemoryStore) ListUnfinished() ([]*Execution, error) {
 	var out []*Execution
 	for _, e := range m.byID {
 		if !e.Status.Terminal() {
+			out = append(out, clone(e))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
+	return out, nil
+}
+
+func (m *MemoryStore) ListResumes(rootID string) ([]*Execution, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*Execution
+	for _, e := range m.byID {
+		if e.RootID == rootID {
 			out = append(out, clone(e))
 		}
 	}
@@ -178,6 +194,15 @@ func (f *FileStore) LoadByIdemKey(key string) (*Execution, error) {
 }
 
 func (f *FileStore) ListUnfinished() ([]*Execution, error) {
+	return f.listMatching(func(e *Execution) bool { return !e.Status.Terminal() })
+}
+
+func (f *FileStore) ListResumes(rootID string) ([]*Execution, error) {
+	return f.listMatching(func(e *Execution) bool { return e.RootID == rootID })
+}
+
+// listMatching 扫描目录下全部执行记录并按条件过滤，结果按开始时间升序。
+func (f *FileStore) listMatching(match func(*Execution) bool) ([]*Execution, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	entries, err := os.ReadDir(f.dir)
@@ -193,7 +218,7 @@ func (f *FileStore) ListUnfinished() ([]*Execution, error) {
 		if err != nil {
 			return nil, err
 		}
-		if e != nil && !e.Status.Terminal() {
+		if e != nil && match(e) {
 			out = append(out, e)
 		}
 	}

@@ -138,6 +138,37 @@ type Definition struct {
 	Stages []Stage
 }
 
+// StepOrigin 标记步骤记录在一次执行中的来源，用于续跑结果审计。
+type StepOrigin string
+
+const (
+	// StepOriginFresh 本次执行中新执行（原始提交）。
+	StepOriginFresh StepOrigin = "fresh"
+	// StepOriginReused 复用续跑链上游执行的成功产出，未重新执行。
+	StepOriginReused StepOrigin = "reused"
+	// StepOriginRerun 续跑中被真正重新执行（上次未完成或状态不确定）。
+	StepOriginRerun StepOrigin = "rerun"
+)
+
+// PolicySource 标记一次执行实际使用的重试/超时规则来源。
+type PolicySource string
+
+const (
+	// PolicySubmitted 原始提交时固化的策略。
+	PolicySubmitted PolicySource = "submitted"
+	// PolicyInherited 续跑沿用上游执行的策略快照。
+	PolicyInherited PolicySource = "inherited"
+	// PolicyOverride 续跑时显式携带的新策略。
+	PolicyOverride PolicySource = "override"
+)
+
+// ResumeOptions 是续跑的可选参数。
+type ResumeOptions struct {
+	// Policy 非 nil 时本次续跑按新规则执行并固化为新快照；
+	// 为 nil 时沿用被续跑执行的策略快照，行为可复现。
+	Policy *ExecPolicy
+}
+
 // StepRecord 持久化单个步骤的执行轨迹。
 type StepRecord struct {
 	Stage    string
@@ -146,20 +177,32 @@ type StepRecord struct {
 	Attempts int
 	Output   map[string]string
 	Err      *StepError
+	// Origin 标记本记录是本次新跑、复用旧产出还是续跑重跑。
+	Origin StepOrigin
+	// SourceExec 仅 Origin=reused 时有效：产出最初由哪次执行生成。
+	SourceExec string
 }
 
 // Execution 是一次工作流执行的完整可持久化记录。
+// 原始提交与每次续跑各自产生一条独立记录，通过 RootID/ResumedFrom 串联成链；
+// 链上已有记录一经终态即只读，不被后续续跑改写。
 type Execution struct {
 	ID         string
 	IdemKey    string
 	Definition Definition
 	Policy     ExecPolicy
-	Status     ExecutionStatus
-	Steps      []*StepRecord
-	Err        *StepError
-	StartedAt  time.Time
-	FinishedAt time.Time
-	Version    int64 // 乐观锁版本号
+	// PolicySource 标记本次执行使用的策略来源（提交固化/续跑沿用/续跑覆盖）。
+	PolicySource PolicySource
+	// RootID 续跑链根（最初）执行 ID；原始执行为自身 ID。
+	RootID string
+	// ResumedFrom 本次续跑直接来源的执行 ID；原始执行为空。
+	ResumedFrom  string
+	Status       ExecutionStatus
+	Steps        []*StepRecord
+	Err          *StepError
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	Version      int64 // 乐观锁版本号
 }
 
 // FindStep 按 stage/step 名查找记录。

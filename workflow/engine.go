@@ -16,26 +16,34 @@ type inflight struct {
 	cancel context.CancelFunc
 }
 
+// resumeInflight 跟踪一次进行中的续跑，按续跑链根 ID 去重。
+type resumeInflight struct {
+	resultID string // 生效续跑产生的新执行 ID
+	done     chan struct{}
+}
+
 // Engine 是工作流执行引擎。
 type Engine struct {
 	exec  Executor
 	store Store
 
-	mu     sync.Mutex
-	live   map[string]*inflight // 按幂等键去重
-	byID   map[string]*inflight // 按执行 ID 取消
-	saveMu sync.Mutex           // 串行化执行记录的变更与持久化
-	logf   func(format string, args ...any)
+	mu         sync.Mutex
+	live       map[string]*inflight // 按幂等键去重
+	byID       map[string]*inflight // 按执行 ID 取消
+	resumeLive map[string]*resumeInflight
+	saveMu     sync.Mutex // 串行化执行记录的变更与持久化
+	logf       func(format string, args ...any)
 }
 
 // NewEngine 创建引擎。
 func NewEngine(exec Executor, store Store) *Engine {
 	return &Engine{
-		exec:  exec,
-		store: store,
-		live:  map[string]*inflight{},
-		byID:  map[string]*inflight{},
-		logf:  func(string, ...any) {},
+		exec:       exec,
+		store:      store,
+		live:       map[string]*inflight{},
+		byID:       map[string]*inflight{},
+		resumeLive: map[string]*resumeInflight{},
+		logf:       func(string, ...any) {},
 	}
 }
 
@@ -96,16 +104,20 @@ func (e *Engine) Submit(ctx context.Context, def Definition, idemKey string, pol
 	}
 
 	exec := &Execution{
-		ID:         f.id,
-		IdemKey:    idemKey,
-		Definition: def,
-		Policy:     policy, // 策略快照随执行固化，复现按当时规则
-		Status:     StatusPending,
-		StartedAt:  time.Now(),
+		ID:           f.id,
+		IdemKey:      idemKey,
+		Definition:   def,
+		Policy:       policy, // 策略快照随执行固化，复现按当时规则
+		PolicySource: PolicySubmitted,
+		RootID:       f.id, // 原始执行是续跑链的根
+		Status:       StatusPending,
+		StartedAt:    time.Now(),
 	}
 	for _, st := range def.Stages {
 		for _, s := range st.Steps {
-			exec.Steps = append(exec.Steps, &StepRecord{Stage: st.Name, Step: s.Name, Status: StepPending})
+			exec.Steps = append(exec.Steps, &StepRecord{
+				Stage: st.Name, Step: s.Name, Status: StepPending, Origin: StepOriginFresh,
+			})
 		}
 	}
 	if err := e.store.Save(exec); err != nil {
@@ -235,7 +247,7 @@ func (e *Engine) run(ctx context.Context, exec *Execution) {
 // runStep 执行单步骤，含重试、超时与错误分类；已成功的步骤直接跳过（恢复语义）。
 func (e *Engine) runStep(ctx context.Context, exec *Execution, stage string, s Step, rec *StepRecord) *StepError {
 	if rec.Status == StepSucceeded {
-		e.log("exec=%s step=%s/%s skip: already succeeded (recovered)", exec.ID, stage, s.Name)
+		e.log("exec=%s step=%s/%s skip: already succeeded (origin=%s source=%s)", exec.ID, stage, s.Name, rec.Origin, rec.SourceExec)
 		return nil
 	}
 	p := exec.Policy.Retry
@@ -371,3 +383,136 @@ func (e *Engine) Recover(ctx context.Context) ([]*Execution, error) {
 
 // Get 读取执行记录。
 func (e *Engine) Get(id string) (*Execution, error) { return e.store.Load(id) }
+
+// Resume 对一次已终态（failed/cancelled/timed_out）的执行发起断点续跑。
+//
+// 语义：
+//   - 生成一条独立的新执行记录（ResumedFrom 指向来源，RootID 指向链根），
+//     来源执行记录保持只读、不被改写；
+//   - 已成功步骤复用旧产出（Origin=reused，SourceExec 追溯产出来源），
+//     不重复触发副作用；partial/skipped/failed/pending 步骤重置后重新执行
+//     （Origin=rerun）；
+//   - 默认沿用来源执行的策略快照（PolicySource=inherited），行为可复现；
+//     opts.Policy 非 nil 时按新规则走（PolicySource=override）并固化为新快照；
+//   - 同一续跑链上并发续跑只有一个生效，其余等待并拿到同一份结果；
+//   - 续跑产生的新执行若再次失败/取消/超时，可对其再次 Resume，链式推进。
+func (e *Engine) Resume(ctx context.Context, execID string, opts ResumeOptions) (*Execution, error) {
+	src, err := e.store.Load(execID)
+	if err != nil {
+		return nil, err
+	}
+	if src == nil {
+		return nil, fmt.Errorf("execution %s not found", execID)
+	}
+	if !src.Status.Terminal() {
+		return nil, fmt.Errorf("execution %s still %s, cannot resume", execID, src.Status)
+	}
+	if src.Status == StatusSucceeded {
+		return nil, fmt.Errorf("execution %s already succeeded, nothing to resume", execID)
+	}
+	root := src.RootID
+	if root == "" { // 兼容特性引入前的旧记录
+		root = src.ID
+	}
+
+	// 并发续跑收敛：同一链上只有一个续跑生效，其余等待拿同一份结果。
+	e.mu.Lock()
+	if rf, ok := e.resumeLive[root]; ok {
+		e.mu.Unlock()
+		e.log("resume root=%s dedup: waiting for in-flight resume result=%s", root, rf.resultID)
+		<-rf.done
+		return e.store.Load(rf.resultID)
+	}
+	rf := &resumeInflight{done: make(chan struct{})}
+	e.resumeLive[root] = rf
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		delete(e.resumeLive, root)
+		e.mu.Unlock()
+		close(rf.done)
+	}()
+
+	// 构造续跑执行：复制定义与步骤记录，按状态判定复用或重跑。
+	policy := src.Policy
+	policySrc := PolicyInherited
+	if opts.Policy != nil {
+		policy = *opts.Policy
+		policySrc = PolicyOverride
+	}
+	next := &Execution{
+		ID:           newID(),
+		IdemKey:      src.IdemKey + "#resume:" + src.ID, // 合成键，避免挤占原幂等键
+		Definition:   src.Definition,
+		Policy:       policy,
+		PolicySource: policySrc,
+		RootID:       root,
+		ResumedFrom:  src.ID,
+		Status:       StatusPending,
+		StartedAt:    time.Now(),
+	}
+	rf.resultID = next.ID
+	for _, rec := range src.Steps {
+		nr := *rec // 拷贝记录，来源记录保持只读
+		nr.Err = rec.Err
+		if rec.Status == StepSucceeded {
+			// 复用旧产出：追溯到真正产出生的那次执行。
+			nr.Origin = StepOriginReused
+			if rec.Origin == StepOriginReused && rec.SourceExec != "" {
+				nr.SourceExec = rec.SourceExec
+			} else {
+				nr.SourceExec = src.ID
+			}
+		} else {
+			// 状态不确定或未算数：重置后重新执行。
+			nr.Status, nr.Attempts, nr.Output, nr.Err = StepPending, 0, nil, nil
+			nr.Origin, nr.SourceExec = StepOriginRerun, ""
+		}
+		next.Steps = append(next.Steps, &nr)
+	}
+	if err := e.store.Save(next); err != nil {
+		return nil, err
+	}
+	e.log("resume root=%s from=%s new-exec=%s policy-source=%s reused=%d rerun=%d",
+		root, src.ID, next.ID, policySrc, countOrigin(next, StepOriginReused), countOrigin(next, StepOriginRerun))
+
+	// 登记 inflight 使 run 可取消，随后执行。
+	f := &inflight{id: next.ID, done: make(chan struct{})}
+	e.mu.Lock()
+	e.live[next.IdemKey] = f
+	e.mu.Unlock()
+	e.run(ctx, next)
+	e.finish(next.IdemKey, f)
+
+	if next.Err != nil { // 避免把类型化 nil 塞进 error 接口
+		return next, next.Err
+	}
+	return next, nil
+}
+
+func countOrigin(exec *Execution, o StepOrigin) int {
+	n := 0
+	for _, r := range exec.Steps {
+		if r.Origin == o {
+			n++
+		}
+	}
+	return n
+}
+
+// ResumeChain 返回 execID 所在续跑链的全部执行记录（含最初的执行），
+// 按开始时间升序，便于审计哪一步在什么时候被补救过。
+func (e *Engine) ResumeChain(execID string) ([]*Execution, error) {
+	exec, err := e.store.Load(execID)
+	if err != nil {
+		return nil, err
+	}
+	if exec == nil {
+		return nil, fmt.Errorf("execution %s not found", execID)
+	}
+	root := exec.RootID
+	if root == "" {
+		root = exec.ID
+	}
+	return e.store.ListResumes(root)
+}

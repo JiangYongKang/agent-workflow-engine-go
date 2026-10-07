@@ -77,4 +77,34 @@ func main() {
 		fmt.Printf("== recovered %s: status=%s fetch-calls-during-recover=%d (expect 1, fetch-b only)\n",
 			r.ID, r.Status, ex.Calls("fetch")-fetchBefore)
 	}
+
+	// 4) 断点续跑：aggregate 失败导致执行失败，续跑只重跑未完成步骤。
+	once := workflow.ExecPolicy{Retry: workflow.RetryPolicy{
+		MaxAttempts: 1, Backoff: 50 * time.Millisecond, StepTimeout: 2 * time.Second,
+	}}
+	ex.ScriptFailures("aggregate", workflow.ErrScripted) // 仅第一次 aggregate 失败
+	failed, err := eng.Submit(context.Background(), def, "run-3", once)
+	fmt.Printf("== run-3: status=%s err=%v\n", failed.Status, err)
+
+	fetchBefore, aggBefore := ex.Calls("fetch"), ex.Calls("aggregate")
+	resumed, err := eng.Resume(context.Background(), failed.ID, workflow.ResumeOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("== resume of run-3: exec=%s status=%s policy-source=%s fetch-rerun=%d agg-rerun=%d\n",
+		resumed.ID, resumed.Status, resumed.PolicySource,
+		ex.Calls("fetch")-fetchBefore, ex.Calls("aggregate")-aggBefore)
+	for _, rec := range resumed.Steps {
+		fmt.Printf("   step=%s/%s origin=%s source=%s status=%s\n",
+			rec.Stage, rec.Step, rec.Origin, rec.SourceExec, rec.Status)
+	}
+	chain, err := eng.ResumeChain(failed.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("== resume chain of run-3: %d records\n", len(chain))
+	for i, c := range chain {
+		fmt.Printf("   [%d] exec=%s status=%s from=%s policy-source=%s\n",
+			i, c.ID, c.Status, c.ResumedFrom, c.PolicySource)
+	}
 }
