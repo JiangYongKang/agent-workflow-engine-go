@@ -148,6 +148,87 @@ type StepRecord struct {
 	Err      *StepError
 }
 
+// ResumeStatus 表示一次续跑记录的生命周期状态。
+type ResumeStatus string
+
+const (
+	ResumePending   ResumeStatus = "pending"
+	ResumeRunning   ResumeStatus = "running"
+	ResumeSucceeded ResumeStatus = "succeeded"
+	ResumeFailed    ResumeStatus = "failed"
+	ResumeCancelled ResumeStatus = "cancelled"
+	ResumeTimedOut  ResumeStatus = "timed_out"
+)
+
+// Terminal 报告续跑状态是否为终态。
+func (s ResumeStatus) Terminal() bool {
+	switch s {
+	case ResumeSucceeded, ResumeFailed, ResumeCancelled, ResumeTimedOut:
+		return true
+	}
+	return false
+}
+
+// StepOutcome 表示续跑中单个步骤的处置方式，用于区分“复用旧产出”与“真正重跑”。
+type StepOutcome string
+
+const (
+	// OutcomeReused 步骤在上次执行中已成功，本次直接复用其产出，未触发执行器。
+	OutcomeReused StepOutcome = "reused"
+	// OutcomeReran 步骤上次未成功或状态不确定，本次真正重新执行。
+	OutcomeReran StepOutcome = "reran"
+)
+
+// StepResumeRecord 是单个步骤在一次续跑中的记录：复用或重跑的判定与结果。
+type StepResumeRecord struct {
+	Stage    string
+	Step     string
+	Outcome  StepOutcome
+	Status   StepStatus // 复用步骤为 succeeded；重跑步骤为本次实际终态
+	Attempts int        // 仅重跑步骤有值
+	Output   map[string]string
+	Err      *StepError
+}
+
+// ResumeRecord 是一次续跑的独立可持久化记录，可一路关联回最初的执行。
+type ResumeRecord struct {
+	// ID 本次续跑记录自身的唯一 ID。
+	ID string
+	// RootExecutionID 最初执行的 ID，整条续跑链恒定不变。
+	RootExecutionID string
+	// ParentID 上一条记录：第一次续跑指向最初执行 ID，之后指向上一次续跑 ID。
+	ParentID string
+	// Attempt 续跑序号，从 1 开始。
+	Attempt int
+	// PolicyInherited 为 true 表示沿用最初执行固化的策略；false 表示本次显式携带新策略。
+	PolicyInherited bool
+	Policy          ExecPolicy
+	Status          ResumeStatus
+	Steps           []*StepResumeRecord
+	Err             *StepError
+	StartedAt       time.Time
+	FinishedAt      time.Time
+	Version         int64 // 乐观锁版本号
+}
+
+// FindStep 按 stage/step 名查找续跑步骤记录。
+func (r *ResumeRecord) FindStep(stage, step string) *StepResumeRecord {
+	for _, s := range r.Steps {
+		if s.Stage == stage && s.Step == step {
+			return s
+		}
+	}
+	return nil
+}
+
+// ResumeChain 是最初执行与其全部续跑记录的审计视图，按续跑序号升序。
+type ResumeChain struct {
+	Root         *Execution
+	Resumes      []*ResumeRecord
+	HeadID       string // 链头记录 ID：无续跑时为最初执行 ID
+	HeadIsResume bool   // 链头是否为续跑记录
+}
+
 // Execution 是一次工作流执行的完整可持久化记录。
 type Execution struct {
 	ID         string

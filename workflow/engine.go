@@ -21,21 +21,30 @@ type Engine struct {
 	exec  Executor
 	store Store
 
-	mu     sync.Mutex
-	live   map[string]*inflight // 按幂等键去重
-	byID   map[string]*inflight // 按执行 ID 取消
-	saveMu sync.Mutex           // 串行化执行记录的变更与持久化
-	logf   func(format string, args ...any)
+	mu   sync.Mutex
+	live map[string]*inflight // 按幂等键去重
+	byID map[string]*inflight // 按执行 ID 取消
+	// liveResume 按最初执行 ID 串行化同一执行的续跑，保证并发续跑只有一个生效。
+	liveResume map[string]*inflight
+	// resumeLocks 为每个最初执行提供一把串行锁：续跑的“解析→执行→收尾”全程持锁。
+	resumeLocks map[string]*sync.Mutex
+	// resumeBatchEnd 记录每个 root 当前续跑批次的收敛宽限截止时刻。
+	resumeBatchEnd map[string]time.Time
+	saveMu         sync.Mutex // 串行化执行记录的变更与持久化
+	logf           func(format string, args ...any)
 }
 
 // NewEngine 创建引擎。
 func NewEngine(exec Executor, store Store) *Engine {
 	return &Engine{
-		exec:  exec,
-		store: store,
-		live:  map[string]*inflight{},
-		byID:  map[string]*inflight{},
-		logf:  func(string, ...any) {},
+		exec:           exec,
+		store:          store,
+		live:           map[string]*inflight{},
+		byID:           map[string]*inflight{},
+		liveResume:     map[string]*inflight{},
+		resumeLocks:    map[string]*sync.Mutex{},
+		resumeBatchEnd: map[string]time.Time{},
+		logf:           func(string, ...any) {},
 	}
 }
 
@@ -345,6 +354,7 @@ func (e *Engine) Cancel(id string) error {
 
 // Recover 扫描存储中的非终态执行，从一致状态继续执行。
 // 已完成的步骤不重复执行（不重复产生副作用），策略按提交时快照复现。
+// 同时接管中断在一半的续跑记录：续跑途中崩溃/重启后仍可从最新状态继续。
 func (e *Engine) Recover(ctx context.Context) ([]*Execution, error) {
 	unfinished, err := e.store.ListUnfinished()
 	if err != nil {
@@ -365,6 +375,33 @@ func (e *Engine) Recover(ctx context.Context) ([]*Execution, error) {
 		e.run(ctx, exec)
 		e.finish(exec.IdemKey, f)
 		out = append(out, exec)
+	}
+
+	resumes, err := e.store.ListUnfinishedResumes()
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range resumes {
+		root, err := e.store.Load(rec.RootExecutionID)
+		if err != nil {
+			return nil, err
+		}
+		if root == nil {
+			e.log("recover resume=%s skipped: root execution %s missing", rec.ID, rec.RootExecutionID)
+			continue
+		}
+		e.mu.Lock()
+		if _, busy := e.liveResume[root.ID]; busy { // 已在续跑中
+			e.mu.Unlock()
+			continue
+		}
+		f := &inflight{id: rec.ID, done: make(chan struct{})}
+		e.liveResume[root.ID] = f
+		e.mu.Unlock()
+
+		e.log("recover resume=%s root=%s attempt=%d status=%s", rec.ID, root.ID, rec.Attempt, rec.Status)
+		e.runResume(ctx, root, rec)
+		e.finishResume(root.ID, f)
 	}
 	return out, nil
 }
